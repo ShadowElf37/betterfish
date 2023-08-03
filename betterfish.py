@@ -17,6 +17,66 @@ def white_noise(theta_fwhm=7., sigma_T=33., sigma_P=56., l_max=2500):
 
     return {'tt': NT, 'ee': NP}
 
+
+class Observables:
+    def __init__(self, classy_template, params, fiducial, dx):
+        self.parameters = params
+        self.classy_params = classy_template | dict(zip(params, fiducial))
+
+        self.fiducial = np.array(fiducial)
+        self.dx = np.array(dx)
+
+        self.model_fid = Class()
+        self.model_fid.set(self.classy_params)
+        self.cl_fid = None
+        self.cl_left = {p:None for p in params}
+        self.cl_right = {p: None for p in params}
+
+        self.computed = False
+
+    @classmethod
+    def _make_and_compute_cl(cls, params, l_max, lensed_cl):
+        """
+        This function is run by the multiprocessing pool. Not meant for your use
+        """
+        model = Class()
+        model.set(params)
+        model.compute()
+        if lensed_cl:
+            return model.lensed_cl(l_max)
+        return model.raw_cl(l_max)
+
+    def compute(self, l_max=2500, lensed_cl=True):
+        """
+        Compute fiduciary and left/right CLASSes. Run this before trying to get fisher matrices.
+        """
+        with Pool(None) as pool:
+            promises = []
+            #print('spawning...')
+            for i, p in enumerate(self.parameters):
+                left = self.classy_params.copy()
+                left[p] -= self.dx[i]
+                promises.append(pool.apply_async(self._make_and_compute_cl, (left, l_max, lensed_cl)))
+
+                right = self.classy_params.copy()
+                right[p] += self.dx[i]
+                promises.append(pool.apply_async(self._make_and_compute_cl, (right, l_max, lensed_cl)))
+
+            #print('getting...')
+            self.model_fid.compute()
+            if lensed_cl:
+                self.cl_fid = self.model_fid.lensed_cl(l_max)#pool.apply_async(self.make_and_compute_cl, self.classy_params, l_max, lensed_cl).get()
+            else:
+                self.cl_fid = self.model_fid.raw_cl(l_max)
+
+            for i, p in enumerate(self.parameters):
+                self.cl_left[p] = promises[2*i].get()
+                self.cl_right[p] = promises[2*i+1].get()
+            #print('done!')
+
+        self.computed = True
+
+
 class CMB_S4(Experiment):
     def __init__(self, f_sky=0.65, l_min=2, l_max=2500, verbose=False, noise_curves={}):
         # NOISE SHOULD BE DIMENSIONFUL (µK^2)
@@ -34,33 +94,44 @@ class CMB_S4(Experiment):
         self.T_cmb = 1
 
     def get_cov(self, cl):
+        """
+        Get full covariance matrices from Cl dict
+        """
         covmat = np.zeros((self.l_max+1, len(self.channels), len(self.channels)))
         for i in range(len(self.channels)):
             for j in range(0, i + 1):
                 chan_name = self.channels[j] + self.channels[i]
-                covmat[:, i, j] = cl[chan_name] + self.noise.get(chan_name, 0)/self.T_cmb
-                covmat[:, j, i] = cl[chan_name] + self.noise.get(chan_name, 0)/self.T_cmb
+                covmat[:, i, j] = covmat[:, j, i] = cl[chan_name] + self.noise.get(chan_name, 0)/self.T_cmb
         return covmat[self.l_min:]
 
-    def get_dcov(self, inputs):
+    def get_dcov(self, inputs: Observables):
+        """
+        Get derivatives of covariance matrices from left/right CLASSes
+        """
         derivatives = {}
         for i,p in enumerate(inputs.parameters):
             derivatives[p] = (self.get_cov(inputs.cl_right[p]) - self.get_cov(inputs.cl_left[p])) / (2*inputs.dx[i])
         return derivatives
 
-    def get_fisher(self, inputs):
+    def get_fisher(self, inputs: Observables):
+        """
+        Get fisher matrix
+        """
+        if not inputs.computed:
+            raise RuntimeError("You need to run Inputs.compute() first")
+
         T_cmb_normed = inputs.model_fid.T_cmb()
         self.T_cmb = (T_cmb_normed * 1.0e6) ** 2
         coeffs = (2 * self.l + 1) / 2 * self.f_sky
 
         covs = self.get_cov(inputs.cl_fid) * self.T_cmb
 
-        print("making derivatives...")
+        #print("making derivatives...")
         dcovs = self.get_dcov(inputs)
         dcovs = {k:v*self.T_cmb for k,v in dcovs.items()}
         invs = np.linalg.inv(covs)
 
-        print('making fisher...')
+        #print('making fisher...')
         fisher = np.zeros((len(inputs.parameters), len(inputs.parameters)))
         for j in range(len(inputs.parameters)):
             for i in range(0, j+1):
@@ -68,53 +139,6 @@ class CMB_S4(Experiment):
                 fisher[i, j] = fisher[j, i] = np.dot(np.trace(multiplied, axis1=1, axis2=2), coeffs)
         return fisher
 
-class Observables:
-    def __init__(self, classy_template, params, fiducial, dx):
-        self.parameters = params
-        self.classy_params = classy_template | dict(zip(params, fiducial))
-
-        self.fiducial = np.array(fiducial)
-        self.dx = np.array(dx)
-
-        self.model_fid = Class()
-        self.model_fid.set(self.classy_params)
-        self.cl_fid = None
-        self.cl_left = {p:None for p in params}
-        self.cl_right = {p: None for p in params}
-
-    @classmethod
-    def make_and_compute_cl(cls, params, l_max, lensed_cl):
-        model = Class()
-        model.set(params)
-        model.compute()
-        if lensed_cl:
-            return model.lensed_cl(l_max)
-        return model.raw_cl(l_max)
-
-    def compute(self, l_max=2500, lensed_cl=True):
-        with Pool(None) as pool:
-            promises = []
-            #print('spawning...')
-            for i, p in enumerate(self.parameters):
-                left = self.classy_params.copy()
-                left[p] -= self.dx[i]
-                promises.append(pool.apply_async(self.make_and_compute_cl, (left, l_max, lensed_cl)))
-
-                right = self.classy_params.copy()
-                right[p] += self.dx[i]
-                promises.append(pool.apply_async(self.make_and_compute_cl, (right, l_max, lensed_cl)))
-
-            #print('getting...')
-            self.model_fid.compute()
-            if lensed_cl:
-                self.cl_fid = self.model_fid.lensed_cl(l_max)#pool.apply_async(self.make_and_compute_cl, self.classy_params, l_max, lensed_cl).get()
-            else:
-                self.cl_fid = self.model_fid.raw_cl(l_max)
-
-            for i, p in enumerate(self.parameters):
-                self.cl_left[p] = promises[2*i].get()
-                self.cl_right[p] = promises[2*i+1].get()
-            #print('done!')
 
 
 

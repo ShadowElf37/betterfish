@@ -4,8 +4,8 @@ betterfish_example.py
 This is a recreation of the default example in the README of fishchips
 https://github.com/xzackli/fishchips-public
 
-Fisher matrix calculation is 10x faster on my machine for this example.
-CLASS computations are sped up with multiprocessing, so the improvement depends heavily on the machine. On mine it is ~3x.
+Fisher matrix calculation is 10x faster on my machine for this example. (0.01s vs 0.1s)
+CLASS computations are sped up with multiprocessing, so the improvement depends heavily on the machine. On mine it is ~3x. (7s vs 18s)
 """
 
 from betterfish import Observables, CMB_S4, white_noise
